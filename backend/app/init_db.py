@@ -8,6 +8,7 @@ import asyncpg
 from app.core.config import settings
 from app.crud import user_crud
 from app.models.user_model import User, UserCreate
+from app.models import chat_model  # noqa: F401  (registers tables for create_all)
 from dotenv import load_dotenv
 from loguru import logger
 import psycopg2

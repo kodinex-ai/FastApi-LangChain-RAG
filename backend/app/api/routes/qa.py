@@ -18,8 +18,11 @@ from langchain.memory import ConversationBufferMemory
 
 from langchain.prompts.prompt import PromptTemplate
 from app.schemas.chat_schema import ChatBody
-from fastapi import APIRouter, Depends
-from app.api.deps import CurrentUser, get_current_user
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from app.api.deps import CurrentUser, SessionDep, get_current_user
+from app.crud import chat_crud
 from app.models.user_model import User
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -39,8 +42,6 @@ with open(config_path, "r") as config_file:
 chat_config = config.get("CHAT_CONFIG", None)
 
 logger.info(f"Chat config: {chat_config}")
-
-chat_history = [AIMessage(content="Hello, I am a bot. How can I help you?")]
 
 
 def get_context_retriever_chain(vector_store):
@@ -85,40 +86,89 @@ def get_conversational_rag_chain(retriever_chain):
     return create_retrieval_chain(retriever_chain, stuff_documents_chain)
 
 
-@router.post("/chat")
-async def chat_action(
-    request: ChatBody,
-    current_user: User = Depends(get_current_user),
-):
-    global chat_history
-
+def get_vector_store():
     embeddings = OpenAIEmbeddings()
-
-    store = PGVector(
+    return PGVector(
         collection_name="docs",
         connection_string=settings.SYNC_DATABASE_URI,
         embedding_function=embeddings,
     )
 
-    # retriever = store.as_retriever()
 
-    user_message = HumanMessage(content=request.message)
+def to_messages(rows) -> list:
+    return [
+        HumanMessage(content=row.content)
+        if row.role == chat_crud.ROLE_HUMAN
+        else AIMessage(content=row.content)
+        for row in rows
+    ]
 
-    retriever_chain = get_context_retriever_chain(store)
-    conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
 
-    logger.info(f"User message: {user_message.content}")
-    logger.info(f"Chat history: {chat_history}")
-    response = conversation_rag_chain.invoke(
-        {"chat_history": chat_history, "input": user_message}
+@router.post("/chat")
+def chat_action(
+    request: ChatBody,
+    session: SessionDep,
+    current_user: User = Depends(get_current_user),
+):
+    # Sync endpoint (runs in the threadpool) so a request waiting on the
+    # conversation lock does not block the event loop.
+    user_id = current_user.id
+
+    if request.conversation_id is None:
+        conversation = chat_crud.create_conversation(session=session, user_id=user_id)
+        chat_history = []
+    else:
+        try:
+            session.exec(
+                text(
+                    f"SET LOCAL lock_timeout = '{int(settings.CHAT_LOCK_TIMEOUT_SECONDS)}s'"
+                )
+            )
+            # Ownership-checked lookup + row lock: serializes requests on the
+            # same conversation across workers until commit/rollback.
+            conversation = chat_crud.get_user_conversation(
+                session=session,
+                conversation_id=request.conversation_id,
+                user_id=user_id,
+                lock=True,
+            )
+        except OperationalError:
+            session.rollback()
+            raise HTTPException(status_code=409, detail="Conversation is busy")
+        if conversation is None:
+            # Same response whether it does not exist or belongs to someone else.
+            raise HTTPException(status_code=403, detail="Conversation not accessible")
+        chat_history = to_messages(
+            chat_crud.get_recent_messages(
+                session=session,
+                conversation_id=conversation.id,
+                limit=settings.CHAT_HISTORY_MAX_MESSAGES,
+            )
+        )
+
+    try:
+        retriever_chain = get_context_retriever_chain(get_vector_store())
+        conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
+        response = conversation_rag_chain.invoke(
+            {"chat_history": chat_history, "input": request.message}
+        )
+        answer = response["answer"]
+    except Exception:
+        # Nothing is persisted (incl. a newly created conversation) on failure.
+        session.rollback()
+        logger.exception("Answer generation failed")
+        raise HTTPException(status_code=500, detail="Failed to generate answer")
+
+    chat_crud.add_message_pair(
+        session=session,
+        conversation_id=conversation.id,
+        question=request.message,
+        answer=answer,
     )
+    conversation_id = conversation.id
+    session.commit()
 
-    chat_history.append(user_message)
-
-    ai_message = AIMessage(content=response["answer"])
-    chat_history.append(ai_message)
-
-    return {"data": response["answer"]}
+    return {"data": answer, "conversation_id": str(conversation_id)}
 
     # # Load prompts from configuration
     # _template_condense = chat_config["PROMPTS"]["CONDENSE_QUESTION"]
