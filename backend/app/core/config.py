@@ -38,6 +38,11 @@ class Settings(BaseSettings):
 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
 
+    # Max stored messages (human + ai) passed to the chain as context
+    CHAT_HISTORY_MAX_MESSAGES: int = 20
+    # Max seconds to wait for another request on the same conversation
+    CHAT_LOCK_TIMEOUT_SECONDS: int = 120
+
     FIRST_SUPERUSER: str
     FIRST_SUPERUSER_PASSWORD: str
 
